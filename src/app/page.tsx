@@ -58,6 +58,7 @@ export default function Dashboard() {
   const [apiSecret, setApiSecret] = useState(() => { if (typeof window !== 'undefined') return localStorage.getItem('aladeen_api_secret') || ''; return ''; });
   const [apiConnected, setApiConnected] = useState(false);
   const [balance, setBalance] = useState(0);
+  const [positions, setPositions] = useState<any[]>([]);
   const [bots, setBots] = useState<BotCfg[]>(() => {
     if (typeof window === 'undefined') return [
       { id: 'trend', name: 'Trend Bot', color: '#3b82f6', market: 'BTCUSDT', enabled: false, running: false, trades: 0, wins: 0, losses: 0, pnl: 0 },
@@ -167,24 +168,42 @@ export default function Dashboard() {
     try { const b = await apiCall('/api/balance', { apiKey, apiSecret }); setBalance(b.available); } catch (e: any) { addDebug(`Balance refresh failed: ${e.message}`, 'error'); }
   }, [apiConnected, apiKey, apiSecret, addDebug]);
 
-  // Place REAL order via API
+  // Fetch positions from Binance
+  const refreshPositions = useCallback(async () => {
+    if (!apiConnected || !apiKey || !apiSecret) return;
+    try {
+      const pos = await apiCall('/api/positions', { apiKey, apiSecret });
+      setPositions(pos);
+    } catch (e: any) { addDebug(`Positions fetch failed: ${e.message}`, 'error'); }
+  }, [apiConnected, apiKey, apiSecret, addDebug]);
+
+  // Place REAL order via API + TP/SL
   const placeRealOrder = async (bot: BotCfg, side: 'BUY' | 'SELL', qty: number, tp: number, sl: number) => {
     if (!apiConnected || !apiKey || !apiSecret) { addDebug(`Cannot trade: API not connected`, 'error'); return null; }
     addDebug(`${bot.name} placing ${side} order on ${bot.market} (qty: ${qty.toFixed(4)})...`);
     try {
-      // Set leverage
-      try { await apiCall('/api/order', { apiKey, apiSecret, symbol: bot.market, side: 'BUY', quantity: '0', leverage }); } catch { /* leverage may already be set */ }
-      // Place market order
+      // Set leverage first
+      try { await apiCall('/api/order', { apiKey, apiSecret, symbol: bot.market, side: 'BUY', quantity: '0', leverage }); } catch { /* leverage already set */ }
+      // Place market entry order
       const order = await apiCall('/api/order', { apiKey, apiSecret, symbol: bot.market, side, quantity: qty.toFixed(4), leverage });
-      addDebug(`Order #${order.orderId} placed successfully!`, 'success');
-      // Place TP via Algo Order API
-      try { await apiCall('/api/algo', { apiKey, apiSecret, symbol: bot.market, side: side === 'BUY' ? 'SELL' : 'BUY', quantity: qty.toFixed(4), stopPrice: tp.toFixed(1), workingType: 'MARK_PRICE', reduceOnly: 'true' }); addDebug(`TP set @ ${fmtPrice(tp)}`, 'success'); } catch (e: any) { addDebug(`TP algo failed: ${e.message}. Trying fallback...`, 'error'); try { await apiCall('/api/order', { apiKey, apiSecret, symbol: bot.market, side: side === 'BUY' ? 'SELL' : 'BUY', type: 'STOP_MARKET', quantity: qty.toFixed(4), stopPrice: tp.toFixed(1), closePosition: true }); addDebug(`TP fallback OK`, 'success'); } catch (e2: any) { addDebug(`TP fallback also failed: ${e2.message}`, 'error'); } }
-      // Place SL via Algo Order API
-      try { await apiCall('/api/algo', { apiKey, apiSecret, symbol: bot.market, side: side === 'BUY' ? 'SELL' : 'BUY', quantity: qty.toFixed(4), stopPrice: sl.toFixed(1), workingType: 'MARK_PRICE', reduceOnly: 'true' }); addDebug(`SL set @ ${fmtPrice(sl)}`, 'success'); } catch (e: any) { addDebug(`SL algo failed: ${e.message}. Trying fallback...`, 'error'); try { await apiCall('/api/order', { apiKey, apiSecret, symbol: bot.market, side: side === 'BUY' ? 'SELL' : 'BUY', type: 'STOP_MARKET', quantity: qty.toFixed(4), stopPrice: sl.toFixed(1), closePosition: true }); addDebug(`SL fallback OK`, 'success'); } catch (e2: any) { addDebug(`SL fallback also failed: ${e2.message}`, 'error'); } }
+      addDebug(`Order #${order.orderId} placed!`, 'success');
+
+      // Place SL - STOP_MARKET with closePosition
+      try {
+        await apiCall('/api/order', { apiKey, apiSecret, symbol: bot.market, side: side === 'BUY' ? 'SELL' : 'BUY', type: 'STOP_MARKET', stopPrice: sl.toFixed(1), closePosition: 'true', workingType: 'MARK_PRICE' });
+        addDebug(`SL set @ ${fmtPrice(sl)}`, 'success');
+      } catch (e: any) { addDebug(`SL failed: ${e.message}`, 'error'); }
+
+      // Place TP - TAKE_PROFIT_MARKET with closePosition
+      try {
+        await apiCall('/api/order', { apiKey, apiSecret, symbol: bot.market, side: side === 'BUY' ? 'SELL' : 'BUY', type: 'TAKE_PROFIT_MARKET', stopPrice: tp.toFixed(1), closePosition: 'true', workingType: 'MARK_PRICE' });
+        addDebug(`TP set @ ${fmtPrice(tp)}`, 'success');
+      } catch (e: any) { addDebug(`TP failed: ${e.message}`, 'error'); }
+
       return order;
     } catch (e: any) {
       addDebug(`Order failed: ${e.message}`, 'error');
-      if (e.message?.includes('MIN_NOTIONAL')) addDebug('Order too small. Need minimum 5 USDT notional.', 'info');
+      if (e.message?.includes('MIN_NOTIONAL')) addDebug('Order too small. Min 5 USDT notional.', 'info');
       return null;
     }
   };
@@ -225,9 +244,10 @@ export default function Dashboard() {
   useEffect(() => {
     if (!apiConnected) return;
     refreshBal();
-    const iv = setInterval(refreshBal, 30000);
+    refreshPositions();
+    const iv = setInterval(() => { refreshBal(); refreshPositions(); }, 10000);
     return () => clearInterval(iv);
-  }, [apiConnected, refreshBal]);
+  }, [apiConnected, refreshBal, refreshPositions]);
 
   // Bot trading loop
   useEffect(() => {
@@ -423,6 +443,24 @@ export default function Dashboard() {
               <div className="p-2">{candles.length > 0 ? <CandleChart candles={candles} signals={smc?.signals || []} market={activeMarket} timeframe={timeframe} /> : <div className="flex items-center justify-center h-[340px] text-[#64748b] text-sm">Loading chart...</div>}</div>
             </div>
             <div className="space-y-3">
+              {/* Live Positions from Binance */}
+              <div className="glass" style={{ border: positions.length > 0 ? '1px solid rgba(16,185,129,0.2)' : undefined }}>
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-2"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#10b981" strokeWidth="2"><path d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg><span className="text-xs font-semibold">Binance Positions</span></div>
+                  <span className="text-[10px] text-[#64748b]">{positions.length} open</span>
+                </div>
+                {positions.length === 0 && <div className="text-[11px] text-[#64748b] text-center py-1">No open positions on Binance</div>}
+                {positions.map((pos, i) => (
+                  <div key={i} className="flex items-center justify-between py-1 border-b border-[#1e293b] last:border-0">
+                    <div>
+                      <span className="text-[11px] font-semibold" style={{ color: parseFloat(pos.positionAmt) > 0 ? '#10b981' : '#ef4444' }}>{parseFloat(pos.positionAmt) > 0 ? 'LONG' : 'SHORT'}</span>
+                      <span className="text-[10px] text-[#64748b] ml-1">{pos.symbol}</span>
+                      <span className="text-[10px] text-[#94a3b8] ml-1">{Math.abs(parseFloat(pos.positionAmt))} @ {parseFloat(pos.entryPrice).toFixed(1)}</span>
+                    </div>
+                    <span className={`text-[11px] font-mono font-bold ${parseFloat(pos.unRealizedProfit) >= 0 ? 'text-[#10b981]' : 'text-[#ef4444]'}`}>{parseFloat(pos.unRealizedProfit) >= 0 ? '+' : ''}{parseFloat(pos.unRealizedProfit).toFixed(2)} ({((parseFloat(pos.unRealizedProfit) / (parseFloat(pos.entryPrice) * Math.abs(parseFloat(pos.positionAmt)))) * 100).toFixed(1)}%)</span>
+                  </div>
+                ))}
+              </div>
               {/* Trend */}
               <div className="glass">
                 <div className="flex items-center gap-2 mb-2"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#06b6d4" strokeWidth="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2" /></svg><span className="text-xs font-semibold">Market Analysis</span></div>
